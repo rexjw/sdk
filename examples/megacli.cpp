@@ -23,6 +23,8 @@
 #include "megacli.h"
 #include <fstream>
 #include <bitset>
+#include <map>
+#include <algorithm>
 
 #if defined(_WIN32) && defined(_DEBUG)
 // so we can delete a secret internal CrytpoPP singleton
@@ -1791,6 +1793,93 @@ static void dumptree(Node* n, bool recurse, int depth, const char* title, ofstre
     }
 }
 
+namespace
+{
+
+struct ft_info_t
+{
+public:
+    string const    ft_name;
+
+    uint32_t        ft_count = 0;
+    uint64_t        ft_bytes = 0;
+
+    ft_info_t(const string& name) : ft_name(name)
+    {}
+};
+
+struct ftstat_cb_t
+{
+public: 
+    std::map<std::string, ft_info_t> data;
+};
+
+string find_type_name(const char* displayname)
+{
+    if (displayname == nullptr)
+    {
+        return "";
+    }
+
+    const char* p = strrchr(displayname, '.');
+    if (p == nullptr)
+    {
+        return "";
+    }
+
+    return p + 1;
+}
+
+void ftstat_collect(ftstat_cb_t& cb, const Node* node)
+{
+    if (node == nullptr)
+    {
+        return;
+    }
+
+    if (node->type == FILENODE)
+    {
+        const string ft_name = find_type_name(node->displayname());
+
+        auto it = cb.data.find(ft_name);
+        if (it == cb.data.end())
+        {
+            cb.data.emplace(ft_name, ft_name);
+            it = cb.data.find(ft_name);
+        }
+
+        it->second.ft_count += 1;
+        it->second.ft_bytes += node->size;
+    }
+    else
+    {
+        for (const auto& child : node->children)
+        {
+            ftstat_collect(cb, child);
+        }
+    }
+}
+
+void ftstat_print(const ftstat_cb_t& cb)
+{
+    for (const auto& duo : cb.data)
+    {
+        cout << "file-type: ";
+        if (!duo.first.empty())
+        {
+            cout << "\"" << duo.first << "\"";
+        }
+        else
+        {
+            cout << "(empty)";
+        }
+        cout << "; \tcount: " << duo.second.ft_count
+                << "; \ttotal-bytes: " << duo.second.ft_bytes << endl;
+    }
+}
+
+} // anonymous namespace
+
 #ifdef USE_FILESYSTEM
 static void local_dumptree(const fs::path& de, int recurse, int depth = 0)
 {
@@ -3043,7 +3132,11 @@ autocomplete::ACN autocompleteSyntax()
     p->Add(exec_session, sequence(text("session"), opt(sequence(text("autoresume"), opt(param("id"))))));
     p->Add(exec_mount, sequence(text("mount")));
     p->Add(exec_ls, sequence(text("ls"), opt(flag("-R")), opt(sequence(flag("-tofile"), param("filename"))), opt(remoteFSFolder(client, &cwd))));
+    p->Add(exec_ftstat, sequence(text("ftstat")));
     p->Add(exec_cd, sequence(text("cd"), opt(remoteFSFolder(client, &cwd))));
+    p->Add(exec_dirs, sequence(text("dirs")));
+    p->Add(exec_pushd, sequence(text("pushd"), opt(remoteFSFolder(client, &cwd))));
+    p->Add(exec_popd, sequence(text("popd")));
     p->Add(exec_pwd, sequence(text("pwd")));
     p->Add(exec_lcd, sequence(text("lcd"), opt(localFSFolder())));
 #ifdef USE_FILESYSTEM
@@ -3597,6 +3690,14 @@ void exec_ls(autocomplete::ACState& s)
     }
 }
 
+void exec_ftstat(autocomplete::ACState& s)
+{
+    Node* node = client->nodeByHandle(cwd);
+    ftstat_cb_t cb;
+    ftstat_collect(cb, node);
+    ftstat_print(cb);
+}
+
 void exec_cd(autocomplete::ACState& s)
 {
     if (s.words.size() > 1)
@@ -3620,6 +3721,94 @@ void exec_cd(autocomplete::ACState& s)
     else
     {
         cwd = NodeHandle().set6byte(client->rootnodes[0]);
+    }
+}
+
+
+namespace
+{
+
+vector<string> s_dir_stack;
+
+Node* fetch_dir_node(const string& tag, const string& dir)
+{
+    Node* node = nodebypath(dir.c_str());
+    if (node == nullptr)
+    {
+        cout << tag << ": " << dir << ": No such file or directory" << endl;
+        return nullptr;
+    }
+    else if (node->type == FILENODE)
+    {
+        cout << tag << ": " << dir << ": Not a directory" << endl;
+        return nullptr;
+    }
+
+    return node;
+}
+
+} // anonymous namespace
+
+void exec_dirs(autocomplete::ACState& s)
+{
+    string path;
+    nodepath(cwd, &path);
+    cout << " -- " << path << endl;
+
+    for (size_t x = s_dir_stack.size(); x > 0; --x)
+    {
+        cout << "    " << s_dir_stack[x-1] << endl;
+    }
+}
+
+void exec_pushd(autocomplete::ACState& s)
+{
+    if (s.words.size() > 1)
+    {
+        Node* node = fetch_dir_node(s.words[0].s, s.words[1].s);
+        if (node)
+        {
+            string dir;
+            nodepath(cwd, &dir);
+            s_dir_stack.push_back(dir);
+
+            cwd = node->nodeHandle();
+        }
+    }
+    else
+    {
+        if (s_dir_stack.empty())
+        {
+            cout << "pushd: no other directory" << endl;
+            return;
+        }
+
+        Node* node = fetch_dir_node(s.words[0].s, s_dir_stack.back());
+        if (node)
+        {
+            string dir;
+            nodepath(cwd, &dir);
+            s_dir_stack.pop_back();
+            s_dir_stack.push_back(dir);
+
+            cwd = node->nodeHandle();
+        }
+    }
+}
+
+void exec_popd(autocomplete::ACState& s)
+{
+    if (s_dir_stack.empty())
+    {
+        cout << "popd: directory stack empty" << endl;
+        return;
+    }
+
+    Node* node = fetch_dir_node(s.words[0].s, s_dir_stack.back());
+    if (node)
+    {
+        s_dir_stack.pop_back();
+        cwd = node->nodeHandle();
     }
 }
 
